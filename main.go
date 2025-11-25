@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // header 를 제외한 컨텐츠를 구분하기 위해서는 구분자가 필요함
@@ -29,8 +31,28 @@ func main() {
 			fmt.Println("Usage: gogit hash-object <filename>")
 			os.Exit(1)
 		}
-		cmdHashObject(os.Args[2])
-		fmt.Println("Hashing object...")
+		hash, err := hashObject(os.Args[2], "blob")
+		if err != nil {
+			fmt.Printf("Error hashing object: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(hash)
+		os.Exit(0)
+	case "write-tree":
+		hash, err := cmdWriteTree(".")
+		if err != nil {
+			fmt.Printf("Error writing tree: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(hash)
+		os.Exit(0)
+	case "ls-tree":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: gogit ls-tree <tree-id>")
+			os.Exit(1)
+		}
+		cmdLsTree(os.Args[2])
+		fmt.Println("Listing tree...")
 		os.Exit(0)
 	case "cat-file":
 		if len(os.Args) < 4 || os.Args[2] != "-p" {
@@ -64,17 +86,17 @@ func cmdInit() {
 	fmt.Println("Initialized emtpy goGit repository in .gogit")
 }
 
-// Hash-Object: Blob 생성
-func cmdHashObject(filename string) {
-	content, err := os.ReadFile(filename)
+func hashObject(path string, typeStr string) (string, error) {
+	content, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("Error reading file %s: %v\n", filename, err)
-		os.Exit(1)
+		return "", fmt.Errorf("Error reading file %s: %v", path, err)
 	}
+	return storeObject(typeStr, content)
+}
 
-	// Git 은 객체의 종류(blob, tree, commit)와 크기를 헤더에 명시함.
-	// 이 Header 를 통해 나중에 어디까지 읽어야 할지(offset) 을 알 수 있다.
-	header := fmt.Sprintf("blob %d%s", len(content), NUL)
+// typeStr: "blob" 또는 "tree"
+func storeObject(typeStr string, content []byte) (string, error) {
+	header := fmt.Sprintf("%s %d%s", typeStr, len(content), NUL)
 	store := append([]byte(header), content...)
 
 	// Checksum 계산 (SHA-1 Hashing)
@@ -92,7 +114,7 @@ func cmdHashObject(filename string) {
 		os.Exit(1)
 	}
 
-	fmt.Println(hashString)
+	return hashString, nil
 }
 
 func saveObject(hash string, content []byte) error {
@@ -128,6 +150,124 @@ func saveObject(hash string, content []byte) error {
 	}
 
 	return nil
+}
+
+func cmdWriteTree(dirPath string) (string, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return "", err
+	}
+
+	var buffer bytes.Buffer
+
+	// Git 은 entries 를 정렬하고 저장합니다.
+	// 여기서는 순차적으로 쓰인다는 가정하에 생략하고 진행하겠습니다
+	for _, entry := range entries {
+		name := entry.Name()
+
+		if name == ".gogit" || name == ".git" || name == ".gitignore" {
+			continue
+		}
+
+		path := filepath.Join(dirPath, name)
+		var mode string
+		var sha string
+
+		if entry.IsDir() {
+			mode = "40000" // Directory mode
+			sha, err = cmdWriteTree(path)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			mode = "100644" // File mode
+			sha, err = hashObject(path, "blob")
+			if err != nil {
+				return "", err
+			}
+		}
+
+		// Tree Entry 포맷: [mode] [name]\0[SHA-1 Binary 20bytes]
+		shaBytes, err := hex.DecodeString(sha)
+		if err != nil {
+			return "", err
+		}
+
+		fmt.Printf("%s %s\x00", mode, name)
+
+		fmt.Fprintf(&buffer, "%s %s\x00", mode, name)
+		buffer.Write(shaBytes)
+	}
+
+	return storeObject("tree", buffer.Bytes())
+}
+
+func cmdLsTree(hash string) {
+	content, err := readObject(hash)
+	if err != nil {
+		fmt.Printf("Error reading object: %v\n", err)
+		return
+	}
+
+	nullIndex := bytes.IndexByte(content, 0)
+	if nullIndex == -1 {
+		fmt.Println("No null byte found")
+		return
+	}
+
+	payload := content[nullIndex+1:]
+
+	buf := bytes.NewBuffer(payload)
+	for buf.Len() > 0 {
+		// 모드랑 이름 읽기 0 전까지
+		line, err := buf.ReadBytes(0)
+		if err != nil {
+			fmt.Printf("Error reading line: %v\n", err)
+			return
+		}
+
+		// "100644 filename\0" -> "100644 filename"
+		lineStr := string(line[:len(line)-1])
+		parts := strings.Split(lineStr, " ")
+		mode := parts[0]
+		name := parts[1]
+
+		shaBytes := make([]byte, 20)
+		buf.Read(shaBytes)
+		shaStr := hex.EncodeToString(shaBytes)
+
+		typeStr := "blob"
+		if mode == "40000" || mode == "040000" {
+			typeStr = "tree"
+		}
+
+		fmt.Printf("%s %s %s\t%s\n", mode, typeStr, shaStr, name)
+	}
+}
+
+func readObject(hash string) ([]byte, error) {
+	dirName := hash[:2]
+	fileName := hash[2:]
+	path := filepath.Join(".gogit", "objects", dirName, fileName)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	zr, err := zlib.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	content, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, err
+	}
+
+	return content, nil
 }
 
 // 검증 및 디버깅용
