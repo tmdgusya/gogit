@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // header 를 제외한 컨텐츠를 구분하기 위해서는 구분자가 필요함
@@ -46,6 +47,20 @@ func main() {
 		}
 		fmt.Println(hash)
 		os.Exit(0)
+	case "commit-tree":
+		// Usage: gogit commit-tree <tree_sha> -p <parent_sha> -m <message>
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: gogit commit-tree <tree_sha> -m <message> [-p <parent_sha>]")
+			os.Exit(1)
+		}
+		cmdCommitTree(os.Args[2], os.Args[3:])
+	case "log":
+		// Usage: gogit log <commit_sha>
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: gogit log <commit_sha>")
+			os.Exit(1)
+		}
+		cmdLog(os.Args[2])
 	case "ls-tree":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: gogit ls-tree <tree-id>")
@@ -200,6 +215,101 @@ func cmdWriteTree(dirPath string) (string, error) {
 	}
 
 	return storeObject("tree", buffer.Bytes())
+}
+
+func cmdCommitTree(treeSha string, args []string) {
+	parentSha := ""
+	message := ""
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-p" && i+1 < len(args) {
+			parentSha = args[i+1]
+			i++
+		} else if args[i] == "-m" && i+1 < len(args) {
+			message = args[i+1]
+			i++
+		}
+	}
+
+	if message == "" {
+		fmt.Println("Error: commit message is required")
+		return
+	}
+
+	var buffer bytes.Buffer
+	fmt.Fprintf(&buffer, "tree %s\n", treeSha)
+	if parentSha != "" {
+		fmt.Fprintf(&buffer, "parent %s\n", parentSha)
+	}
+
+	timestamp := time.Now().Unix()
+	timezone := "+0000"
+	author := fmt.Sprintf("GoGit User <user@example.com> %d %s", timestamp, timezone)
+
+	fmt.Fprintf(&buffer, "author %s\n", author)
+	fmt.Fprintf(&buffer, "committer %s\n", author)
+	fmt.Fprintf(&buffer, "\n%s\n", message)
+
+	sha, err := storeObject("commit", buffer.Bytes())
+	if err != nil {
+		fmt.Printf("Error committing tree: %v\n", err)
+		return
+	}
+	fmt.Println(sha)
+}
+
+func cmdLog(commitSha string) {
+	currentSha := commitSha
+
+	for {
+		content, err := readObject(currentSha)
+		if err != nil {
+			fmt.Printf("Error reading commit %s: %v\n", currentSha, err)
+			break
+		}
+
+		nullIndex := bytes.IndexByte(content, 0)
+		payload := string(content[nullIndex+1:])
+		lines := strings.Split(payload, "\n")
+
+		fmt.Printf("commit %s\n", currentSha)
+
+		parentSha := ""
+
+		// tree 1231231231
+		// parent 12312321323
+		// author GoGit User <user@example.com> 12312312 KST
+		// committer GoGit User <user@example.com> 12312312 KST
+		// message
+		for _, line := range lines {
+			if strings.HasPrefix(line, "parent ") {
+				parentSha = strings.TrimPrefix(line, "parent ")
+			} else if strings.HasPrefix(line, "author ") {
+				fmt.Printf("author %s\n", line)
+			} else if strings.HasPrefix(line, "committer ") {
+				fmt.Printf("committer %s\n", line)
+			} else if line == "" {
+				break
+			}
+		}
+
+		msgStartIndex := -1
+		for i, line := range lines {
+			if line == "" {
+				msgStartIndex = i + 1
+				break
+			}
+		}
+
+		if msgStartIndex != -1 && msgStartIndex < len(lines) {
+			fmt.Printf("\n    %s\n\n", strings.Join(lines[msgStartIndex:], "\n   "))
+		}
+
+		if parentSha == "" {
+			break
+		}
+		currentSha = parentSha
+	}
 }
 
 func cmdLsTree(hash string) {
