@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -13,8 +14,37 @@ import (
 	"time"
 )
 
+/*
+	[Chapter 4: The Staging Area (Index)]
+
+	Gogit 에서는 .gogit/index 라는 바이너리 파일로 관리됩니다.
+
+	[Binary Format Specification for GoGit Index]
+	----------------------------------------------------------------
+	| Header (12 bytes) |
+	|   - Signature: "DIRC" (4 bytes)
+	|   - Version:   1      (4 bytes, Big Endian)
+	|   - Count:     N      (4 bytes, Big Endian) number of entries
+	----------------------------------------------------------------
+	| Entry 1 (Variable Length)                                    |
+	|   - Mode:      4 bytes (Big Endian)                          |
+	|   - SHA-1:     20 bytes                                      |
+	|   - PathLen:   2 bytes (Big Endian)                          |
+	|   - Path:      PathLen bytes                                 |
+	----------------------------------------------------------------
+	| Entry 2 ...                                                  |
+	----------------------------------------------------------------
+*/
+
 // header 를 제외한 컨텐츠를 구분하기 위해서는 구분자가 필요함
 const NUL = "\000"
+
+type IndexEntry struct {
+	Mode    uint32
+	Hash    [20]byte
+	PathLen uint16
+	Path    string
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -39,6 +69,24 @@ func main() {
 		}
 		fmt.Println(hash)
 		os.Exit(0)
+	case "add":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: gogit add <filename>")
+			os.Exit(1)
+		}
+		err := cmdAdd(os.Args[2])
+		if err != nil {
+			fmt.Printf("Error adding file: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Added file:", os.Args[2])
+		os.Exit(0)
+	case "ls-files":
+		err := cmdLsFile()
+		if err != nil {
+			fmt.Printf("Error listing files: %v\n", err)
+			os.Exit(1)
+		}
 	case "write-tree":
 		hash, err := cmdWriteTree(".")
 		if err != nil {
@@ -82,6 +130,131 @@ func main() {
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
 	}
+}
+
+func cmdLsFile() error {
+	entries, err := readIndex()
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		fmt.Printf("%s\n", entry.Path)
+	}
+	return nil
+}
+
+func cmdAdd(path string) error {
+	hashStr, err := hashObject(path, "blob")
+	if err != nil {
+		return err
+	}
+
+	// 40자 hex 문자열을 20바이트 []byte 슬라이스로 변환
+	hashBytes, _ := hex.DecodeString(hashStr)
+	var hashArr [20]byte
+	copy(hashArr[:], hashBytes)
+
+	entries, err := readIndex()
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	relPath := path
+	found := false
+	for i, entry := range entries {
+		if entry.Path == relPath {
+			entries[i].Hash = hashArr
+			entries[i].Mode = 0100644
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		entries = append(entries, IndexEntry{
+			Mode: 0100644,
+			Hash: hashArr,
+			Path: relPath,
+		})
+	}
+
+	return writeIndex(entries)
+}
+
+func readIndex() ([]IndexEntry, error) {
+	indexPath := ".gogit/index"
+	f, err := os.Open(indexPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var sig [4]byte
+	if _, err := f.Read(sig[:]); err != nil {
+		return nil, err
+	}
+
+	if string(sig[:]) != "DIRC" {
+		return nil, fmt.Errorf("invalid index signature")
+	}
+
+	var version, count uint32
+	binary.Read(f, binary.BigEndian, &version)
+	binary.Read(f, binary.BigEndian, &count)
+
+	entries := make([]IndexEntry, count)
+	for i := range entries {
+		var mode uint32
+		if err := binary.Read(f, binary.BigEndian, &mode); err != nil {
+			return nil, err
+		}
+		entries[i].Mode = mode
+
+		var hash [20]byte
+		if err := binary.Read(f, binary.BigEndian, &hash); err != nil {
+			return nil, err
+		}
+		entries[i].Hash = hash
+
+		var pathLen uint16
+		if err := binary.Read(f, binary.BigEndian, &pathLen); err != nil {
+			return nil, err
+		}
+
+		path := make([]byte, pathLen)
+		if _, err := io.ReadFull(f, path); err != nil {
+			return nil, err
+		}
+		entries[i].Path = string(path)
+	}
+
+	return entries, nil
+}
+
+func writeIndex(entries []IndexEntry) error {
+	indexPath := ".gogit/index"
+	f, err := os.Create(indexPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString("DIRC"); err != nil {
+		return err
+	}
+
+	binary.Write(f, binary.BigEndian, uint32(1))
+	binary.Write(f, binary.BigEndian, uint32(len(entries)))
+
+	for _, entry := range entries {
+		binary.Write(f, binary.BigEndian, entry.Mode)
+		f.Write(entry.Hash[:])
+		binary.Write(f, binary.BigEndian, uint16(len(entry.Path)))
+		f.WriteString(entry.Path)
+	}
+
+	return nil
 }
 
 // Init: 저장소 초기화
