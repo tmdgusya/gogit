@@ -102,6 +102,9 @@ func main() {
 			os.Exit(1)
 		}
 		cmdCommitTree(os.Args[2], os.Args[3:])
+	case "status":
+		cmdStatus()
+		os.Exit(0)
 	case "log":
 		// Usage: gogit log <commit_sha>
 		if len(os.Args) < 3 {
@@ -142,6 +145,72 @@ func cmdLsFile() error {
 		fmt.Printf("%s\n", entry.Path)
 	}
 	return nil
+}
+
+func cmdStatus() {
+	entries, err := readIndex()
+	tracked := make(map[string]bool)
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("No index file found")
+			return
+		}
+		fmt.Printf("Error reading index: %v\n", err)
+		return
+	}
+
+	fmt.Println("Changes to be committed:")
+
+	for _, entry := range entries {
+		_, err := os.Stat(entry.Path)
+		tracked[entry.Path] = true
+		if os.IsNotExist(err) {
+			fmt.Printf("Deleted: %s\n", entry.Path)
+			continue
+		}
+
+		content, _ := os.ReadFile(entry.Path)
+
+		header := fmt.Sprintf("blob %d\000", len(content))
+		store := append([]byte(header), content...)
+
+		hasher := sha1.New()
+		hasher.Write(store)
+		currentHash := hasher.Sum(nil)
+
+		if !bytes.Equal(currentHash, entry.Hash[:]) {
+			fmt.Printf("Modified: %s\n", entry.Path)
+		}
+	}
+
+	// Untracked files
+	var untracked []string
+	filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		name := info.Name()
+		if name == ".gogit" || name == ".git" || name == ".gitignore" {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !info.IsDir() && !tracked[path] {
+			untracked = append(untracked, path)
+		}
+		return nil
+	})
+
+	if len(untracked) > 0 {
+		fmt.Println("\nUntracked files:")
+		for _, file := range untracked {
+			fmt.Printf("  %s\n", file)
+		}
+	}
 }
 
 func cmdAdd(path string) error {
